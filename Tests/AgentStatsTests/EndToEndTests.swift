@@ -12,7 +12,7 @@ import Testing
     server.executableURL = try exampleBinary()
     server.environment = [
         "AGENTSTATS_MCP_KEY": "al_srv_test",
-        "AGENTSTATS_ENDPOINT": endpoint.url,
+        "AGENTSTATS_URL": endpoint.base,
         "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "",
     ]
     let stdin = Pipe()
@@ -80,7 +80,8 @@ final class FakeEndpoint: @unchecked Sendable {
         let raw: String
     }
 
-    let url: String
+    /// What AGENTSTATS_URL is set to; the SDK adds /api/ingest/mcp.
+    let base: String
     private let process = Process()
     private let out = Pipe()
 
@@ -104,7 +105,7 @@ final class FakeEndpoint: @unchecked Sendable {
         var line = Data()
         while !line.contains(UInt8(ascii: "\n")) { line.append(out.fileHandleForReading.availableData) }
         let port = String(decoding: line, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        url = "http://127.0.0.1:\(port)/api/ingest/mcp"
+        base = "http://127.0.0.1:\(port)"
     }
 
     func received(atLeast n: Int, within seconds: Double) async throws -> [Post] {

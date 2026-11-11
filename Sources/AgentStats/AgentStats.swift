@@ -19,7 +19,6 @@ import FoundationNetworking
 
 public final class AgentStats: @unchecked Sendable {
     public static let version = "0.1.0"
-    static let defaultEndpoint = "https://agentstats.io/api/ingest/mcp"
 
     /// Options. Unset values fall back to environment variables and defaults.
     /// A failed request, as passed to `Options.errorText`.
@@ -38,8 +37,6 @@ public final class AgentStats: @unchecked Sendable {
         public var apiKey: String?
         /// Defaults to the name the server reports in `initialize`.
         public var serverName: String?
-        /// Defaults to `AGENTSTATS_ENDPOINT`, else the hosted service.
-        public var endpoint: String?
         /// Fraction of `tools/call` requests recorded.
         public var sampleRate: Double
         /// Send error messages (first 300 characters).
@@ -56,13 +53,12 @@ public final class AgentStats: @unchecked Sendable {
         public var debug: Bool?
 
         public init(
-            apiKey: String? = nil, serverName: String? = nil, endpoint: String? = nil,
+            apiKey: String? = nil, serverName: String? = nil,
             sampleRate: Double = 1, captureErrors: Bool = true, errorText: (@Sendable (ErrorInfo) -> String?)? = nil, captureCatalog: Bool = true,
             flushInterval: TimeInterval = 2, maxBatch: Int = 250, maxBuffer: Int = 10_000, debug: Bool? = nil
         ) {
             self.apiKey = apiKey
             self.serverName = serverName
-            self.endpoint = endpoint
             self.sampleRate = sampleRate
             self.captureErrors = captureErrors
             self.errorText = errorText
@@ -124,6 +120,14 @@ public final class AgentStats: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Where events go: AgentStats. Not an option; `AGENTSTATS_URL` (undocumented) is for AgentStats'
+    /// own development and tests.
+    static func ingestURL(_ base: String?) -> URL {
+        var b = base.flatMap { $0.isEmpty ? nil : $0 } ?? "https://agentstats.io"
+        while b.hasSuffix("/") { b.removeLast() }
+        return URL(string: b + "/api/ingest/mcp") ?? URL(string: "https://agentstats.io/api/ingest/mcp")!
+    }
+
     public let enabled: Bool
     let options: Options
     let apiKey: String
@@ -144,7 +148,7 @@ public final class AgentStats: @unchecked Sendable {
         let key = options.apiKey ?? env["AGENTSTATS_MCP_KEY"] ?? ""
         self.options = options
         self.apiKey = key
-        self.endpoint = URL(string: options.endpoint ?? env["AGENTSTATS_ENDPOINT"] ?? Self.defaultEndpoint) ?? URL(string: Self.defaultEndpoint)!
+        self.endpoint = Self.ingestURL(env["AGENTSTATS_URL"])
         self.debug = options.debug ?? (env["AGENTSTATS_DEBUG"] == "1")
         self.enabled = !key.isEmpty && env["AGENTSTATS_DISABLED"] != "1"
         self.post = Self.httpPost

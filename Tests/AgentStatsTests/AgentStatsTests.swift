@@ -59,6 +59,12 @@ func tracker(_ capture: Capture, sampleRate: Double = 1, captureErrors: Bool = t
     return stats
 }
 
+@Test func sendsToAgentStats() {
+    #expect(AgentStats.ingestURL(nil).absoluteString == "https://agentstats.io/api/ingest/mcp")
+    #expect(AgentStats.ingestURL("").absoluteString == "https://agentstats.io/api/ingest/mcp")
+    #expect(AgentStats.ingestURL("http://localhost:3000/").absoluteString == "http://localhost:3000/api/ingest/mcp")
+}
+
 @Test func recordsEveryRequestWithItsOutcomeAndClient() async throws {
     let capture = Capture()
     let stats = tracker(capture)
