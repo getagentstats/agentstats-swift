@@ -18,7 +18,7 @@ import FoundationNetworking
 #endif
 
 public final class AgentStats: @unchecked Sendable {
-    public static let version = "0.1.0"
+    public static let version = "0.2.0"
 
     /// Options. Unset values fall back to environment variables and defaults.
     /// A failed request, as passed to `Options.errorText`.
@@ -46,6 +46,10 @@ public final class AgentStats: @unchecked Sendable {
         public var errorText: (@Sendable (ErrorInfo) -> String?)?
         /// Send the tool list (names, descriptions, input schemas) when it changes.
         public var captureCatalog: Bool
+        /// Add a `send_feedback` tool to the server's tools, answered by the SDK (it never reaches your handlers),
+        /// so agents can report a tool that failed them and users can pass something on. What they write is sent
+        /// to AgentStats (Feedback, under the server). Off by default.
+        public var feedbackTool: Bool
         public var flushInterval: TimeInterval
         public var maxBatch: Int
         public var maxBuffer: Int
@@ -55,8 +59,9 @@ public final class AgentStats: @unchecked Sendable {
         public init(
             apiKey: String? = nil, serverName: String? = nil,
             sampleRate: Double = 1, captureErrors: Bool = true, errorText: (@Sendable (ErrorInfo) -> String?)? = nil, captureCatalog: Bool = true,
-            flushInterval: TimeInterval = 2, maxBatch: Int = 250, maxBuffer: Int = 10_000, debug: Bool? = nil
+            feedbackTool: Bool = false, flushInterval: TimeInterval = 2, maxBatch: Int = 250, maxBuffer: Int = 10_000, debug: Bool? = nil
         ) {
+            self.feedbackTool = feedbackTool
             self.apiKey = apiKey
             self.serverName = serverName
             self.sampleRate = sampleRate
@@ -111,6 +116,41 @@ public final class AgentStats: @unchecked Sendable {
     }
 
     private var auths: [String: Auth] = [:]
+
+    /// One send_feedback call, queued for the next batch (PROTOCOL.md "Feedback").
+    struct FeedbackItem: Sendable {
+        let ts: Int64
+        let session: String
+        let source: String
+        let tool: String?
+        let content: String
+    }
+
+    private var feedback: [FeedbackItem] = []
+    /// The server lists a send_feedback tool of its own: its calls are left alone.
+    private var serverHasFeedback = false
+
+    var feedbackEnabled: Bool { enabled && options.feedbackTool && !lock.withLock { serverHasFeedback } }
+
+    func noteServerHasFeedback() {
+        lock.withLock { serverHasFeedback = true }
+    }
+
+    /// Queues what a send_feedback call said; false when there's nothing to keep (empty content).
+    func recordFeedback(_ args: [String: Any]?, session: String) -> Bool {
+        let content = String(((args?["content"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).prefix(4000))
+        guard !content.isEmpty else { return false }
+        let tool = (args?["tool"] as? String).flatMap { $0.isEmpty ? nil : String($0.prefix(200)) }
+        let item = FeedbackItem(ts: Int64(Date().timeIntervalSince1970 * 1000), session: session, source: args?["source"] as? String == "user" ? "user" : "agent", tool: tool, content: content)
+        var startWorker = false
+        lock.withLock {
+            if feedback.count >= 100 { feedback.removeFirst() }
+            feedback.append(item)
+            startWorker = worker == nil
+        }
+        if startWorker { startLoop() }
+        return true
+    }
 
     /// Mark a session signed in: its events carry the token's client app and scopes from now on.
     func setAuth(_ auth: Auth?, session: String) {
@@ -207,14 +247,15 @@ public final class AgentStats: @unchecked Sendable {
     /// Parses what was recorded and sends it now. Call before a short-lived process exits.
     public func flush() async {
         guard enabled else { return }
-        let (batch, dropped) = lock.withLock {
-            let taken = (raw, droppedRaw)
+        let (batch, dropped, fb) = lock.withLock {
+            let taken = (raw, droppedRaw, Array(feedback.prefix(50)))
             raw.removeAll(keepingCapacity: true)
             droppedRaw = 0
+            feedback.removeFirst(taken.2.count)
             kicked = false
             return taken
         }
-        let sends = await processor.ingest(batch, droppedMessages: dropped)
+        let sends = await processor.ingest(batch, droppedMessages: dropped, feedback: fb)
         for s in sends {
             let status = await post(endpoint, apiKey, s.body)
             log("sent \(s.events) events\(s.catalogSig != nil ? " + catalog" : "") -> \(status)")
@@ -292,7 +333,10 @@ actor Processor {
         self.options = options
     }
 
-    func ingest(_ batch: [AgentStats.Raw], droppedMessages: Int) -> [Send] {
+    var feedback: [[String: Any]] = []
+    static let contentMethods: Set<String> = ["tools/call", "resources/read", "prompts/get"]
+
+    func ingest(_ batch: [AgentStats.Raw], droppedMessages: Int, feedback items: [AgentStats.FeedbackItem] = []) -> [Send] {
         dropped += droppedMessages
         for r in batch {
             guard let obj = try? JSONSerialization.jsonObject(with: r.data) else { continue }
@@ -300,6 +344,13 @@ actor Processor {
             for case let m as [String: Any] in messages {
                 if r.inbound { request(m, r) } else { response(m, r) }
             }
+        }
+        for f in items {
+            let client = clients[f.session]
+            feedback.append([
+                "ts": f.ts, "sessionId": f.session, "clientName": client?.name ?? NSNull(), "clientVersion": client?.version ?? NSNull(),
+                "source": f.source, "tool": f.tool ?? NSNull(), "content": f.content,
+            ])
         }
         // Requests that never got an answer (a crashed handler, a dropped connection) don't pile up.
         if pending.count > 10_000 { pending.removeAll() }
@@ -364,7 +415,15 @@ actor Processor {
             message = message.map { String($0.prefix(300)) }
         }
         let duration = Double(r.uptimeNs &- p.uptimeNs) / 1_000_000
-        events.append([
+        var extra: [String: Any] = [:]
+        if isError {
+            let code = error?["code"] as? Int
+            extra["errorKind"] = error != nil ? "protocol" : "tool"
+            if error != nil, let code { extra["errorCode"] = code }
+        } else if Self.contentMethods.contains(p.method), let result {
+            extra["resultChars"] = Self.resultChars(result)
+        }
+        events.append(extra.merging([
             "ts": Int64(r.wallMs),
             "method": p.method,
             "tool": p.tool ?? NSNull(),
@@ -375,7 +434,23 @@ actor Processor {
             "clientVersion": p.clientVersion ?? NSNull(),
             "sessionId": r.session,
             "transport": r.transport ?? NSNull(),
-        ].merging(r.auth.map { ["auth": $0.json] } ?? [:]) { a, _ in a })
+        ] as [String: Any]) { a, _ in a }.merging(r.auth.map { ["auth": $0.json] } ?? [:]) { a, _ in a })
+    }
+
+    /// Characters of text a result handed the model (PROTOCOL.md resultChars).
+    static func resultChars(_ result: [String: Any]) -> Int {
+        func text(_ c: Any?) -> Int {
+            guard let c = c as? [String: Any] else { return 0 }
+            if let t = c["text"] as? String { return t.count }
+            if let t = (c["resource"] as? [String: Any])?["text"] as? String { return t.count }
+            return 0
+        }
+        var n = 0
+        for c in (result["content"] as? [Any]) ?? [] { n += text(c) }
+        for c in (result["contents"] as? [Any]) ?? [] { n += text(c) }
+        for m in (result["messages"] as? [[String: Any]]) ?? [] { n += text(m["content"]) }
+        if n == 0, let sc = result["structuredContent"], JSONSerialization.isValidJSONObject(sc), let d = try? JSONSerialization.data(withJSONObject: sc) { n = d.count }
+        return n
     }
 
     /// A cheap signature: tool count, then each name and description length.
@@ -397,12 +472,16 @@ actor Processor {
             inFlight = c
             catalog = nil
         }
-        while !events.isEmpty || pendingCatalog != nil {
+        while !events.isEmpty || pendingCatalog != nil || !feedback.isEmpty {
             let chunk = Array(events.prefix(1000))
             events.removeFirst(chunk.count)
             let name = options.serverName ?? (serverInfo?["name"] as? String)
             var body: [String: Any] = ["serverName": name.map { $0 as Any } ?? NSNull(), "events": chunk, "dropped": dropped]
             dropped = 0
+            if !feedback.isEmpty {
+                body["feedback"] = feedback
+                feedback.removeAll()
+            }
             var sig: String?
             if let c = pendingCatalog {
                 var cat: [String: Any] = ["tools": c.tools]

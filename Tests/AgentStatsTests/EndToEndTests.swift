@@ -46,7 +46,7 @@ import Testing
     if server.isRunning { server.terminate() }
 
     let posts = try await endpoint.received(atLeast: 1, within: 5)
-    #expect(posts.allSatisfy { $0.auth == "Bearer al_srv_test" && $0.sdk == "swift/0.1.0" })
+    #expect(posts.allSatisfy { $0.auth == "Bearer al_srv_test" && $0.sdk == "swift/0.2.0" })
     let events = posts.flatMap { $0.body["events"] as? [[String: Any]] ?? [] }
     // The server handles requests concurrently, so events come in the order responses went out.
     #expect(events.compactMap { $0["method"] as? String }.sorted() == ["initialize", "tools/call", "tools/call", "tools/list"])
